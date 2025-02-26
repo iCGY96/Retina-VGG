@@ -7,10 +7,13 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from tqdm import tqdm  # for progress bars
+from tqdm import tqdm
+import albumentations as A
 
 # Import functions from our custom modules
 from dataset import (
+    ensure_dir,
+    get_file_lists,
     download_mit1003,
     unify_mit1003_as_test,
     download_toronto,
@@ -68,13 +71,12 @@ def fix_seed(seed=42):
     torch.backends.cudnn.benchmark = False
 
 ########################################
-# Modified testing function that returns average metrics
+# Testing function that returns average metrics
 ########################################
 def test_model_loader(model, test_loader, device, print_metrics=True):
     model.eval()
     metric_list = {
-        'CC': [], 'Similarity': [], 'EMD': [], 'KLdiv': [],
-        'NSS': [], 'AUCJudd': [], 'AUCBorji': [], 'AUCshuffled': []
+        'CC': [],  'KLdiv': [], 'AUCJudd': []
     }
     pbar = tqdm(test_loader, desc="Testing", leave=False)
     with torch.no_grad():
@@ -105,18 +107,19 @@ def test_model_loader(model, test_loader, device, print_metrics=True):
     return avg_metrics
 
 ########################################
-# Modified training function with per-epoch testing and best model saving (using CC as criterion)
+# Training function with per-epoch validation on SALICON val set
+# and best model saving using CC as criterion
 ########################################
-def train_model(model, train_loader, test_loader, device, num_epochs=10, model_save_path="best_model.pth"):
-    model.train()
+def train_model(model, train_loader, val_loader, device, num_epochs=10, model_save_path="saliency_model_best_cc.pth"):
     # Use Focal Loss combined with MSELoss
     criterion1 = FocalLoss(gamma=2, alpha=0.25, reduction='mean')
     criterion2 = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=5e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
-
-    best_cc = -float("inf")
+    
+    best_cc = -float('inf')
     for epoch in range(num_epochs):
+        model.train()
         epoch_loss = 0.0
         pbar = tqdm(train_loader, desc=f"Epoch [{epoch+1}/{num_epochs}]", leave=False)
         for images, sal_maps in pbar:
@@ -124,7 +127,7 @@ def train_model(model, train_loader, test_loader, device, num_epochs=10, model_s
             sal_maps = sal_maps.to(device)
             optimizer.zero_grad()
             outputs = model(images)
-            loss = criterion1(outputs, sal_maps) + criterion2(outputs, sal_maps)
+            loss = 0.1 * criterion1(outputs, sal_maps) + criterion2(outputs, sal_maps)
             loss.backward()
             # Gradient clipping for stability
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -134,93 +137,159 @@ def train_model(model, train_loader, test_loader, device, num_epochs=10, model_s
         scheduler.step()
         avg_loss = epoch_loss / len(train_loader)
         print(f"Epoch [{epoch+1}/{num_epochs}] - Average Training Loss: {avg_loss:.4f}")
-
-        # Evaluate on test set per epoch using CC as the criterion
-        avg_metrics = test_model_loader(model, test_loader, device, print_metrics=False)
-        if avg_metrics.get("CC", -float("inf")) > best_cc:
-            best_cc = avg_metrics["CC"]
+        
+        # Validation on SALICON val set
+        val_metrics = test_model_loader(model, val_loader, device, print_metrics=False)
+        current_cc = val_metrics.get('CC', 0)
+        print(f"Epoch [{epoch+1}/{num_epochs}] - Validation CC: {current_cc:.4f}")
+        if current_cc > best_cc:
+            best_cc = current_cc
             torch.save(model.state_dict(), model_save_path)
-            print(f"Epoch {epoch+1}: New best CC: {best_cc:.4f} - Model saved.")
+            print("Best model updated!")
 
     return best_cc
 
 ########################################
-# Main function: Prepare datasets, train on SALICON, and test on MIT1003 and Toronto
+# Main function: Prepare datasets, train on SALICON, and evaluate on MIT1003 and Toronto
 ########################################
 def main():
     fix_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     target_size = 224
+    batch_size = 32
+    num_workers = 16
+    base_data = ensure_dir("data")
 
     ####################################
-    # Prepare SALICON training dataset
+    # Prepare SALICON training and validation datasets
     ####################################
-    print("Preparing SALICON training dataset...")
-    train_img_dir, val_img_dir, train_ann_file, val_ann_file = download_salicon_data()
-    sal_train_img_list, sal_train_fix_list = unify_salicon_api("train", train_img_dir, train_ann_file)
-    cleanup_salicon()  # Clean up temporary SALICON files
+    print("Preparing SALICON dataset...")
+    # Download SALICON data and annotations
+    sal_train_image_dir = os.path.join(base_data, "SALICON", "train", "images")
+    sal_train_fixation_dir = os.path.join(base_data, "SALICON", "train", "fixmaps")
+    sal_val_image_dir = os.path.join(base_data, "SALICON", "val", "images")
+    sal_val_fixation_dir = os.path.join(base_data, "SALICON", "val", "fixmaps")
+    
+    if not os.path.exists(sal_train_image_dir) or not os.listdir(sal_train_image_dir):
+        print("\nProcessing SALICON dataset...")
+        train_image_dir, val_image_dir, train_ann_file, val_ann_file = download_salicon_data()
+        sal_train_image_list, sal_train_fixation_list = unify_salicon_api("train", train_image_dir, train_ann_file)
+        sal_val_image_list, sal_val_fixation_list = unify_salicon_api("val", val_image_dir, val_ann_file)
+        cleanup_salicon()
+    else:
+        print("SALICON dataset already exists. Constructing SaliencyDatasetFromList for train and val...")
+        sal_train_image_list, sal_train_fixation_list = get_file_lists(sal_train_image_dir, sal_train_fixation_dir)
+        sal_val_image_list, sal_val_fixation_list = get_file_lists(sal_val_image_dir, sal_val_fixation_dir)
 
     ####################################
     # Prepare MIT1003 test dataset
     ####################################
     print("\nPreparing MIT1003 test dataset...")
-    download_mit1003()
-    # We only need the test split from MIT1003
-    mit_test_img_list, mit_test_fix_list = unify_mit1003_as_test()
-    cleanup_mit1003()
+    # Process MIT1003 dataset (test set)
+    mit_image_dir = os.path.join(base_data, "MIT1003", "test", "images")
+    mit_fixation_dir = os.path.join(base_data, "MIT1003", "test", "fixmaps")
+    if not os.path.exists(mit_image_dir) or not os.listdir(mit_image_dir):
+        print("Processing MIT1003 dataset...")
+        download_mit1003()
+        mit_image_list, mit_fixation_list = unify_mit1003_as_test()
+        cleanup_mit1003()
+    else:
+        print("MIT1003 dataset already exists. Constructing SaliencyDatasetFromList...")
+        mit_image_list, mit_fixation_list = get_file_lists(mit_image_dir, mit_fixation_dir)
 
     ####################################
     # Prepare Toronto test dataset
     ####################################
     print("\nPreparing Toronto test dataset...")
-    download_toronto()
-    toronto_test_img_list, toronto_test_fix_list = unify_toronto()
-    cleanup_toronto()
+    toronto_image_dir = os.path.join(base_data, "Toronto", "test", "images")
+    toronto_fixation_dir = os.path.join(base_data, "Toronto", "test", "fixmaps")
+    if not os.path.exists(toronto_image_dir) or not os.listdir(toronto_image_dir):
+        print("\nProcessing Toronto dataset...")
+        toronto_image_list, toronto_fixation_list = unify_toronto()
+        cleanup_toronto()
+    else:
+        print("Toronto dataset already exists. Constructing SaliencyDatasetFromList...")
+        toronto_image_list, toronto_fixation_list = get_file_lists(toronto_image_dir, toronto_fixation_dir)
 
     ####################################
     # Create a Retina instance for preprocessing
     ####################################
-    sample_img = cv2.imread(sal_train_img_list[0])
+    # For example, we use OpenCV's bioinspired Retina simulation.
+    sample_img = cv2.imread(sal_train_image_list[0])
     sample_img = cv2.resize(sample_img, (target_size, target_size))
-    # Create a retina simulation instance (using OpenCV's bioinspired module)
     retina = cv2.bioinspired.Retina.create((sample_img.shape[1], sample_img.shape[0]))
     retina.write("retinaParams.xml")
     retina.setup("retinaParams.xml")
 
+    train_aug = A.Compose([
+        A.Resize(target_size, target_size),
+        A.HorizontalFlip(p=0.5),
+        A.ShiftScaleRotate(p=0.5),
+        A.GaussNoise(p=0.5),
+        A.Normalize(),
+    ])
+
+    test_aug = A.Compose([
+        A.Resize(target_size, target_size),
+        A.Normalize(),
+    ])
+
     ####################################
-    # Build DataLoaders
+    # Build DataLoaders for SALICON train and val datasets
     ####################################
     train_dataset = SaliencyDatasetFromList(
-        sal_train_img_list, sal_train_fix_list,
-        retina=retina, target_size=target_size
+        sal_train_image_list, sal_train_fixation_list,
+        aug=train_aug, target_size=target_size
     )
-    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=0)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, persistent_workers=True, num_workers=num_workers)
 
-    mit_test_dataset = SaliencyDatasetFromList(
-        mit_test_img_list, mit_test_fix_list,
-        retina=retina, target_size=target_size
+    val_dataset = SaliencyDatasetFromList(
+        sal_val_image_list, sal_val_fixation_list,
+        aug=test_aug, target_size=target_size
     )
-    mit_test_loader = DataLoader(mit_test_dataset, batch_size=8, shuffle=False, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=True, persistent_workers=True, num_workers=num_workers)
+
+    ####################################
+    # Build DataLoaders for MIT1003 and Toronto test datasets
+    ####################################
+    mit_test_dataset = SaliencyDatasetFromList(
+        mit_image_list, mit_fixation_list,
+        aug=test_aug, target_size=target_size
+    )
+    mit_test_loader = DataLoader(mit_test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
     toronto_test_dataset = SaliencyDatasetFromList(
-        toronto_test_img_list, toronto_test_fix_list,
-        retina=retina, target_size=target_size
+        toronto_image_list, toronto_fixation_list,
+        aug=test_aug, target_size=target_size
     )
-    toronto_test_loader = DataLoader(toronto_test_dataset, batch_size=8, shuffle=False, num_workers=0)
+    toronto_test_loader = DataLoader(toronto_test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
     ####################################
     # Build the model
     ####################################
-    model = PretrainedVGG16Saliency(output_size=target_size).to(device)
+    model = PretrainedVGG16Saliency(output_size=target_size)
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs for training")
+        model = nn.DataParallel(model)
+    model = model.to(device)
+
     print("Model architecture:")
     print(model)
 
     ####################################
-    # Train model on SALICON training set with per-epoch testing on MIT1003 test set
+    # Train model on SALICON training set with per-epoch validation on SALICON val set
     ####################################
     num_epochs = 50
+    model_save_path = "saliency_model_best_cc.pth"
     print("Training on SALICON training set...")
-    best_cc = train_model(model, train_loader, mit_test_loader, device, num_epochs=num_epochs, model_save_path="saliency_model_best_cc.pth")
+    best_cc = train_model(model, train_loader, val_loader, device, num_epochs=num_epochs, model_save_path=model_save_path)
+    print(f"Training completed. Best validation CC: {best_cc:.4f}")
+
+    ####################################
+    # Load the best model for evaluation on test datasets
+    ####################################
+    model.load_state_dict(torch.load(model_save_path))
+    model.eval()
 
     ####################################
     # Final Testing on MIT1003 test set
